@@ -28,4 +28,14 @@ async def assess_impact(event: ThermalEvent) -> ImpactResponse:
         "Wind conditions are sampled at the event coordinates",
         "Terrain and land cover use configured rasters when provided; otherwise a conservative fallback is used",
     ]
-    return ImpactResponse(event_id=event.id, direction=weather["wind_direction"], confidence=round(min(95, event.confidence * 0.82), 1), exposed=exposed, assumptions=assumptions, **spread)
+    return ImpactResponse(
+        event_id=event.id,
+        direction=weather.get("wind_direction", "Unavailable"),
+        confidence=round(min(95, event.confidence * 0.82), 1),
+        exposed=exposed,
+        assumptions=assumptions,
+        wind_speed_kmh=float(weather.get("wind_speed_kmh")) if weather.get("wind_speed_kmh") is not None else None,
+        temperature_c=float(weather.get("temperature_c")) if weather.get("temperature_c") is not None else None,
+        humidity_pct=float(weather.get("humidity_pct")) if weather.get("humidity_pct") is not None else None,
+        **spread,
+    )

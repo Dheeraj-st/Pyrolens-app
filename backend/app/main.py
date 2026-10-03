@@ -13,7 +13,7 @@ except ImportError:  # Allows the demo API to start before optional auth extras 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 
 from .config import get_settings
@@ -24,7 +24,12 @@ from .alerts import send_alert
 from .schemas import (
     ClassificationResponse, HealthResponse, ImpactResponse, IngestionRequest,
     IngestionResponse, JobResponse, RiskResponse, ThermalEvent, AlertRequest, AlertResponse,
+    AlertRecord, AlertActionRequest, AlertActionResponse, DashboardAnalyticsResponse,
+    KPIs, HotspotRegion, UserResponse, UserCreate, UserUpdate, LoginRequest, TokenResponse, UserProfile,
 )
+from .security import has_role_permission, create_access_token, verify_password, ROLE_HIERARCHY
+from .reports import generate_incidents_pdf, generate_incident_dossier_pdf
+from .ml import get_model_metadata
 
 # Initialize database tables BEFORE importing any modules that use the database.
 # ``init_db`` only creates missing tables, so this is safe on every restart.
@@ -56,10 +61,12 @@ class TokenRequest(BaseModel):
 
 def require_role(*allowed_roles: str):
     async def dependency(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
-        if settings.environment == "development" and credentials is None:
-            return {"sub": "demo-analyst", "role": "analyst"}
         if settings.public_read_api and credentials is None and "viewer" in allowed_roles:
             return {"sub": "public-dashboard", "role": "viewer"}
+        if settings.environment == "development" and credentials is None:
+            if any(has_role_permission("analyst", r) for r in allowed_roles):
+                return {"sub": "demo-analyst", "role": "analyst"}
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required (admin required)")
         if credentials is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
         if jwt is None:
@@ -79,8 +86,8 @@ def require_role(*allowed_roles: str):
                 claims = jwt.decode(credentials.credentials, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
         except jwt.PyJWTError as exc:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
-        roles = claims.get("roles", [claims.get("role")])
-        if not any(role in allowed_roles for role in roles):
+        roles = claims.get("roles") or [claims.get("role")]
+        if not any(has_role_permission(role, *allowed_roles) for role in roles if role):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
         return claims
     return dependency
@@ -113,29 +120,31 @@ async def startup() -> None:
     else:
         print("FIRMS_API_KEY not configured, skipping startup fetch", flush=True)
 
-    # Auto-migrate ingestion_runs table (PostgreSQL on Render)
+    # Auto-migrate ingestion_runs table if needed (dialect-agnostic for SQLite and PostgreSQL)
     try:
-        from .database import engine
-        from sqlalchemy import text
+        from .database import engine, init_db
+        init_db()
+        from sqlalchemy import inspect, text
         with engine.connect() as conn:
-            result = conn.execute(text("""
-                SELECT column_name FROM information_schema.columns 
-                WHERE table_name = 'ingestion_runs'
-            """))
-            columns = {row[0] for row in result}
-            
-            if 'records_accepted' not in columns:
-                conn.execute(text("ALTER TABLE ingestion_runs ADD COLUMN records_accepted INTEGER DEFAULT 0"))
-            if 'records_rejected' not in columns:
-                conn.execute(text("ALTER TABLE ingestion_runs ADD COLUMN records_rejected INTEGER DEFAULT 0"))
-            if 'completed_at' not in columns:
-                conn.execute(text("ALTER TABLE ingestion_runs ADD COLUMN completed_at TIMESTAMP WITHOUT TIME ZONE"))
-            if 'finished_at' not in columns:
-                conn.execute(text("ALTER TABLE ingestion_runs ADD COLUMN finished_at TIMESTAMP WITHOUT TIME ZONE"))
-            conn.commit()
-            print("Migration complete")
+            inspector = inspect(conn)
+            if "ingestion_runs" in inspector.get_table_names():
+                columns = {col["name"] for col in inspector.get_columns("ingestion_runs")}
+                is_pg = engine.dialect.name == "postgresql"
+                col_type = "TIMESTAMP WITHOUT TIME ZONE" if is_pg else "TIMESTAMP"
+                
+                if "records_accepted" not in columns:
+                    conn.execute(text("ALTER TABLE ingestion_runs ADD COLUMN records_accepted INTEGER DEFAULT 0"))
+                if "records_rejected" not in columns:
+                    conn.execute(text("ALTER TABLE ingestion_runs ADD COLUMN records_rejected INTEGER DEFAULT 0"))
+                if "completed_at" not in columns:
+                    conn.execute(text(f"ALTER TABLE ingestion_runs ADD COLUMN completed_at {col_type}"))
+                if "finished_at" not in columns:
+                    conn.execute(text(f"ALTER TABLE ingestion_runs ADD COLUMN finished_at {col_type}"))
+                conn.commit()
+                print("Migration complete", flush=True)
     except Exception as e:
-        print(f"Migration warning: {e}")
+        logger.warning(f"Migration warning: {e}")
+
 
 
 @app.get("/health", response_model=HealthResponse, tags=["system"])
@@ -155,22 +164,43 @@ async def favicon():
 
 
 @app.get("/v1/models", tags=["system"])
+@app.get("/api/v1/models", tags=["system"])
+@app.get("/api/v1/ml/metadata", tags=["system"])
 async def list_models() -> dict:
-    """List available ML models."""
+    """List available ML models and runtime inference capability."""
+    meta = get_model_metadata()
     return {
-        "models": [
-            {
-                "id": "xgboost-synthetic-v1",
-                "name": "XGBoost Synthetic v1",
-                "version": "1.0",
-                "type": "classification",
-                "description": "Synthetic XGBoost model for fire classification",
-                "status": "active",
-                "created_at": "2024-01-01T00:00:00Z",
-            }
-        ],
-        "default": "xgboost-synthetic-v1",
+        "models": [meta],
+        "default": meta["version"],
+        "runtime": meta["status"],
+        **meta,
     }
+
+
+
+@app.post("/api/v1/auth/login", response_model=TokenResponse, tags=["auth"])
+async def login(credentials: LoginRequest) -> TokenResponse:
+    username = credentials.username.strip()
+    user = repository.get_user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+
+
+
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is deactivated")
+
+    if not verify_password(credentials.password, user.hashed_password):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+
+    repository.record_login(user.username)
+    token, expires = create_access_token(user.username, role=user.role)
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_at=expires,
+        user=repository._user_to_schema(user),
+    )
 
 
 @app.post("/api/v1/auth/token", tags=["auth"])
@@ -181,9 +211,24 @@ async def create_token(request: TokenRequest) -> dict:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="PyJWT is not installed")
     if request.role not in {"viewer", "analyst", "admin"}:
         raise HTTPException(status_code=422, detail="role must be viewer, analyst, or admin")
-    expires = datetime.now(timezone.utc) + timedelta(hours=8)
-    token = jwt.encode({"sub": request.username, "role": request.role, "exp": expires}, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    token, expires = create_access_token(request.username, role=request.role)
     return {"access_token": token, "token_type": "bearer", "expires_at": expires}
+
+
+@app.get("/api/v1/auth/me", response_model=UserProfile, tags=["auth"])
+async def get_current_user_profile(user_claims: dict = Depends(require_role("viewer", "analyst", "admin"))) -> UserProfile:
+    username = user_claims.get("sub", "unknown")
+    role = user_claims.get("role", "viewer")
+    user = repository.get_user_by_username(username)
+    return UserProfile(
+        sub=username,
+        username=username,
+        role=role,
+        permissions=list(ROLE_HIERARCHY.get(role.lower(), {role.lower()})),
+        email=user.email if user else f"{username}@pyrolens.org",
+        full_name=user.full_name if user else username.title(),
+    )
+
 
 
 @app.get("/api/v1/events", response_model=list[ThermalEvent], tags=["events"])
@@ -321,11 +366,258 @@ async def event_exposure(event_id: str, _: dict = Depends(require_role("viewer",
 
 
 @app.post("/api/v1/events/{event_id}/alerts", response_model=AlertResponse, tags=["alerts"])
-async def issue_alert(event_id: str, request: AlertRequest, _: dict = Depends(require_role("analyst", "admin"))) -> AlertResponse:
+async def issue_alert(event_id: str, request: AlertRequest, user_claims: dict = Depends(require_role("analyst", "admin"))) -> AlertResponse:
     event = await get_event(event_id)
     deliveries = await send_alert(event, request.channels, request.recipients, request.message)
     status_value = "sent" if any(delivery["status"] == "sent" for delivery in deliveries) else "recorded"
-    return AlertResponse(event_id=event.id, status=status_value, deliveries=deliveries)
+    severity = request.severity or event.risk_level
+    message = request.message or f"PyroLens {severity} alert: {event.name} at {event.location}. Risk score: {event.risk_score:.0f}/100."
+    alert_record = repository.create_alert(
+        event_id=event.id,
+        severity=severity,
+        message=message,
+        channels=request.channels,
+        recipients=request.recipients,
+        deliveries=deliveries,
+    )
+    return AlertResponse(event_id=event.id, status=status_value, deliveries=deliveries, alert_id=alert_record.id)
+
+
+@app.get("/api/v1/alerts", response_model=list[AlertRecord], tags=["alerts"])
+async def list_alerts(
+    status_filter: str | None = Query(None, alias="status"),
+    severity: str | None = None,
+    event_id: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    _: dict = Depends(require_role("viewer", "analyst", "admin")),
+) -> list[AlertRecord]:
+    return repository.list_alerts(status=status_filter, severity=severity, event_id=event_id, limit=limit, offset=offset)
+
+
+@app.get("/api/v1/alerts/{alert_id}", response_model=AlertRecord, tags=["alerts"])
+async def get_alert(alert_id: str, _: dict = Depends(require_role("viewer", "analyst", "admin"))) -> AlertRecord:
+    alert = repository.get_alert(alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return alert
+
+
+@app.post("/api/v1/alerts/{alert_id}/acknowledge", response_model=AlertActionResponse, tags=["alerts"])
+async def acknowledge_alert(
+    alert_id: str,
+    action_req: AlertActionRequest | None = None,
+    user_claims: dict = Depends(require_role("analyst", "admin")),
+) -> AlertActionResponse:
+    username = user_claims.get("sub", "analyst")
+    alert = repository.acknowledge_alert(alert_id, username=username)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return AlertActionResponse(
+        alert_id=alert.id,
+        status=alert.status,
+        action="acknowledged",
+        updated_by=username,
+        updated_at=alert.acknowledged_at or datetime.now(timezone.utc),
+    )
+
+
+@app.post("/api/v1/alerts/{alert_id}/resolve", response_model=AlertActionResponse, tags=["alerts"])
+async def resolve_alert(
+    alert_id: str,
+    action_req: AlertActionRequest | None = None,
+    user_claims: dict = Depends(require_role("analyst", "admin")),
+) -> AlertActionResponse:
+    username = user_claims.get("sub", "analyst")
+    alert = repository.resolve_alert(alert_id, username=username)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return AlertActionResponse(
+        alert_id=alert.id,
+        status=alert.status,
+        action="resolved",
+        updated_by=username,
+        updated_at=alert.resolved_at or datetime.now(timezone.utc),
+    )
+
+
+@app.get("/api/v1/events/{event_id}/alerts", response_model=list[AlertRecord], tags=["alerts"])
+async def get_event_alerts(event_id: str, _: dict = Depends(require_role("viewer", "analyst", "admin"))) -> list[AlertRecord]:
+    return repository.get_alerts_for_event(event_id)
+
+
+# =============================================================================
+# DASHBOARD & ANALYTICS ENDPOINTS (Grounded in real database data)
+# =============================================================================
+@app.get("/api/v1/analytics/dashboard", response_model=DashboardAnalyticsResponse, tags=["analytics"])
+@app.get("/api/v1/dashboard/stats", response_model=DashboardAnalyticsResponse, tags=["analytics"])
+async def get_dashboard_analytics(_: dict = Depends(require_role("viewer", "analyst", "admin"))) -> DashboardAnalyticsResponse:
+    return repository.get_dashboard_analytics()
+
+
+@app.get("/api/v1/analytics/kpis", response_model=KPIs, tags=["analytics"])
+async def get_analytics_kpis(_: dict = Depends(require_role("viewer", "analyst", "admin"))) -> KPIs:
+    return repository.get_dashboard_analytics().kpis
+
+
+@app.get("/api/v1/analytics/hotspots", response_model=list[HotspotRegion], tags=["analytics"])
+async def get_analytics_hotspots(
+    limit: int = Query(10, ge=1, le=50),
+    _: dict = Depends(require_role("viewer", "analyst", "admin")),
+) -> list[HotspotRegion]:
+    regions = repository.get_dashboard_analytics().hotspot_regions
+    return regions[:limit]
+
+
+# =============================================================================
+# GIS / MVT / GEOJSON ENDPOINTS
+# =============================================================================
+@app.get("/api/v1/geo/incidents.geojson", tags=["geospatial"])
+@app.get("/api/v1/geo/events.geojson", tags=["geospatial"])
+async def geojson_incidents(
+    min_risk: float = Query(0, ge=0, le=100),
+    event_type: str | None = None,
+    status_filter: str | None = Query(None, alias="status"),
+    limit: int = Query(600, ge=1, le=1000),
+    _: dict = Depends(require_role("viewer", "analyst", "admin")),
+) -> dict:
+    events = [
+        e for e in repository.list()
+        if not e.id.startswith("FE-") and e.risk_score >= min_risk
+        and (not event_type or e.event_type.lower() == event_type.lower())
+        and (not status_filter or e.status.lower() == status_filter.lower())
+    ][:limit]
+    features = [
+        {
+            "type": "Feature",
+            "id": ev.id,
+            "geometry": {
+                "type": "Point",
+                "coordinates": [ev.longitude, ev.latitude],
+            },
+            "properties": {
+                "id": ev.id,
+                "name": ev.name,
+                "location": ev.location,
+                "event_type": ev.event_type,
+                "risk_score": ev.risk_score,
+                "risk_level": ev.risk_level,
+                "confidence": ev.confidence,
+                "frp_mw": ev.frp_mw,
+                "brightness_kelvin": ev.brightness_kelvin,
+                "status": ev.status,
+                "observed_at": ev.observed_at.isoformat(),
+            },
+        }
+        for ev in events
+    ]
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+
+
+@app.get("/api/v1/geo/incidents/{event_id}/impact.geojson", tags=["geospatial"])
+async def geojson_incident_impact(
+    event_id: str,
+    _: dict = Depends(require_role("viewer", "analyst", "admin")),
+) -> dict:
+    event = await get_event(event_id)
+    impact = await assess_impact(event)
+    return {
+        "type": "Feature",
+        "id": f"{event_id}-impact",
+        "geometry": impact.impact_zone_geojson,
+        "properties": {
+            "event_id": event.id,
+            "name": event.name,
+            "direction": impact.direction,
+            "impact_zone_km2": impact.impact_zone_km2,
+            "confidence": impact.confidence,
+            "model": impact.model,
+            "wind_speed_kmh": impact.wind_speed_kmh,
+            "temperature_c": impact.temperature_c,
+            "humidity_pct": impact.humidity_pct,
+        },
+    }
+
+
+@app.get("/api/v1/geo/tiles/{z}/{x}/{y}.pbf", tags=["geospatial"])
+async def vector_tile(
+    z: int,
+    x: int,
+    y: int,
+    _: dict = Depends(require_role("viewer", "analyst", "admin")),
+) -> Response:
+    """Mapbox Vector Tile endpoint. Returns MVT protobuf with PostGIS ST_AsMVT when available."""
+    from .database import engine, SessionLocal
+    if engine and engine.dialect.name == "postgresql":
+        try:
+            from sqlalchemy import text
+            with SessionLocal() as db:
+                stmt = text("""
+                    WITH bounds AS (
+                        SELECT ST_TileEnvelope(:z, :x, :y) AS geom
+                    ),
+                    mvtgeom AS (
+                        SELECT id, name, type, risk_score, confidence,
+                               ST_AsMVTGeom(ST_Transform(ST_SetSRID(ST_MakePoint(lng, lat), 4326), 3857), bounds.geom) AS geom
+                        FROM incidents, bounds
+                        WHERE ST_Intersects(ST_Transform(ST_SetSRID(ST_MakePoint(lng, lat), 4326), 3857), bounds.geom)
+                    )
+                    SELECT ST_AsMVT(mvtgeom.*, 'incidents') FROM mvtgeom;
+                """)
+                tile_bytes = db.execute(stmt, {"z": z, "x": x, "y": y}).scalar()
+                if tile_bytes:
+                    return Response(content=tile_bytes, media_type="application/x-protobuf")
+        except Exception:
+            pass
+    return Response(status_code=204, media_type="application/x-protobuf", headers={"X-GIS-Engine": "sqlite-fallback"})
+
+
+# =============================================================================
+# ADMIN USER MANAGEMENT ENDPOINTS (Strictly requires admin role)
+# =============================================================================
+@app.get("/api/v1/admin/users", response_model=list[UserResponse], tags=["admin"])
+async def admin_list_users(_: dict = Depends(require_role("admin"))) -> list[UserResponse]:
+    return repository.list_users()
+
+
+@app.post("/api/v1/admin/users", response_model=UserResponse, status_code=201, tags=["admin"])
+async def admin_create_user(user_data: UserCreate, _: dict = Depends(require_role("admin"))) -> UserResponse:
+    existing = repository.get_user_by_username(user_data.username)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Username '{user_data.username}' is already registered")
+    if len(user_data.password) < 6:
+        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+    return repository.create_user(user_data)
+
+
+@app.get("/api/v1/admin/users/{user_id}", response_model=UserResponse, tags=["admin"])
+async def admin_get_user(user_id: str, _: dict = Depends(require_role("admin"))) -> UserResponse:
+    user = repository.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@app.patch("/api/v1/admin/users/{user_id}", response_model=UserResponse, tags=["admin"])
+async def admin_update_user(user_id: str, update_data: UserUpdate, _: dict = Depends(require_role("admin"))) -> UserResponse:
+    user = repository.update_user(user_id, update_data)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@app.delete("/api/v1/admin/users/{user_id}", status_code=200, tags=["admin"])
+async def admin_delete_user(user_id: str, current_claims: dict = Depends(require_role("admin"))) -> dict:
+    target = repository.get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.username == current_claims.get("sub"):
+        raise HTTPException(status_code=400, detail="Cannot delete your own administrative account")
+    repository.delete_user(user_id)
+    return {"status": "deleted", "user_id": user_id}
 
 
 @app.get("/api/v1/layers/infrastructure", tags=["layers"])
@@ -418,6 +710,44 @@ async def export_incidents(_: dict = Depends(require_role("analyst", "admin"))) 
     for event in repository.list():
         writer.writerow([event.id, event.name, event.latitude, event.longitude, event.event_type, event.risk_score, event.risk_level, event.status, event.observed_at.isoformat()])
     return StreamingResponse(iter([buffer.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=pyrolens-incidents.csv"})
+
+
+@app.get("/api/v1/reports/incidents.pdf", tags=["reports"])
+async def export_incidents_pdf(
+    min_risk: float = Query(0, ge=0, le=100),
+    status_filter: str | None = Query(None, alias="status"),
+    limit: int = Query(100, ge=1, le=500),
+    _: dict = Depends(require_role("analyst", "admin")),
+) -> Response:
+    events = [
+        e for e in repository.list()
+        if not e.id.startswith("FE-") and e.risk_score >= min_risk
+        and (not status_filter or e.status.lower() == status_filter.lower())
+    ][:limit]
+    stats = repository.get_dashboard_analytics()
+    pdf_bytes = generate_incidents_pdf(events, stats)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=pyrolens-incidents-report.pdf"},
+    )
+
+
+@app.get("/api/v1/reports/incidents/{event_id}.pdf", tags=["reports"])
+@app.get("/api/v1/events/{event_id}/report.pdf", tags=["reports"])
+async def export_incident_dossier_pdf(
+    event_id: str,
+    _: dict = Depends(require_role("analyst", "admin")),
+) -> Response:
+    event = await get_event(event_id)
+    impact = await assess_impact(event)
+    alerts = repository.get_alerts_for_event(event_id)
+    pdf_bytes = generate_incident_dossier_pdf(event, impact=impact, alerts=alerts)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=pyrolens-incident-{event.id}.pdf"},
+    )
 
 
 @app.get("/api/v1/providers", tags=["system"])
