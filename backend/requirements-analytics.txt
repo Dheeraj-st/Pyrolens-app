@@ -1,10 +1,10 @@
 # Optional local analytics stack. Docker installs this on Python 3.12.
 # On Python 3.14, run the API with requirements.txt only; it automatically
 # uses rule-based classification and conservative impact fallbacks.
-joblib==1.4.2
-numpy==2.2.2
-scikit-learn==1.6.1
-xgboost==2.1.4
-shap==0.46.0
-geopandas==1.0.1
-rasterio==1.4.3
+joblib==1.6.0
+numpy==2.5.3
+scikit-learn==1.9.1
+xgboost==3.4.1
+shap==0.52.0
+geopandas==1.2.0
+rasterio==1.5.2
