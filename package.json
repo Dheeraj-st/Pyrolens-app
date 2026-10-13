@@ -18,7 +18,7 @@
     "react-router-dom": "^6.26.0",
     "leaflet": "^1.9.4",
     "react-leaflet": "^4.2.1",
-    "lucide-react": "^0.383.0",
+    "lucide-react": "^1.54.0",
     "recharts": "^2.12.7"
   },
   "devDependencies": {
